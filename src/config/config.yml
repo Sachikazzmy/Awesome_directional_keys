@@ -1,0 +1,11 @@
+# 第一版config.yaml作为键盘快捷键的存放地址，可以在这里完成快捷键自定义操作
+
+
+hotkeys:
+  up: "<shift>+w"
+
+  left: "<shift>+a"
+
+  down: "<shift>+s"
+  
+  right: "<shift>+d"

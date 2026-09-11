@@ -1,2 +1,4 @@
 .venv/
 .DS_Dtore
+tests/
+__pycache__
