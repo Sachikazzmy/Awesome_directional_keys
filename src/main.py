@@ -22,3 +22,6 @@ with keyboard.GlobalHotKeys({
 
         }) as h:
     h.join()
+
+
+    

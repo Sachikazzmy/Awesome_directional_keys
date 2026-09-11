@@ -9,3 +9,6 @@ hotkeys:
   down: "<shift>+s"
   
   right: "<shift>+d"
+
+  fullscreen_only: True  
+  # True=有铺满全屏窗口时只在这些窗口间切换; False=恢复旧行为(全量切换)
