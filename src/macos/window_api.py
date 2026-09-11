@@ -1,68 +1,80 @@
 # -*- coding: utf-8 -*-
 """
-simple_actions.py -- shift + W/A/S/D 快捷键动作实现。
+window_api.py -- macos/ 平台层唯一文件 (单文件精简版): 本项目所有 macOS 系统
+API 的导入与调用都集中在这里, 用分隔线划分区域职能。
 
-本次实现 shift+a / shift+d: 按“屏幕横向位置”切换当前最靠前的窗口。
+上层 actions/simple_actions.py 只使用本文件暴露的纯 Python 接口, 不再出现任何
+pyobjc / 子进程细节:
+    QUARTZ_OK / AX_OK              -- pyobjc 子模块可用性标志 (True/False)
+    list_visible_windows()         -- 当前 Space 内可见普通窗口 (z 序, 前 -> 后)
+    mark_fullscreen_windows(wins)  -- 就地为窗口列表标记 fullscreen: True/False
+    focus_window(target)           -- 把目标窗口带到最前, 并用 z 序实时确认生效
+    run_diagnostics(target_pid)    -- 诊断模式: 逐环自检切换链路 (排障用)
 
-    shift+a  把焦点切到当前窗口“左边相邻”的窗口; 已在最左则不做任何切换
-    shift+d  把焦点切到当前窗口“右边相邻”的窗口; 已在最右则不做任何切换
+依赖: pynput 在 macOS 上自动安装 pyobjc (Quartz/AppKit/ApplicationServices),
+本文件直接复用, 不引入新的第三方依赖。
 
-“左右关系”按窗口左上角在 macOS CG 全局坐标系里的 X 坐标从左到右排序得到,
-天然覆盖内建屏 + 外接屏的多显示器布局。例如: 内建屏的 chatgpt 在最左、外接屏
-左半的 chrome 居中、外接屏右半的 vscode 在最右, 焦点在 vscode 时:
-    按 shift+a -> 切到 chrome; 再按 -> 切到 chatgpt; 已在最左, 再按不切换
-    按 shift+d -> 方向相反
-
-用到的 macOS API:
-    1) Quartz.CGWindowListCopyWindowInfo(OnScreenOnly | ExcludeDesktopElements)
-       一次调用拿到当前 Space 内全部可见普通窗口 (layer 0) 的 pid、应用名、
+用到的 macOS API 总览 (各区域分隔线下有更具体的说明):
+    1) Quartz / CoreGraphics Window Services
+       CGWindowListCopyWindowInfo 一次拿到当前 Space 全部可见窗口的 pid、应用名、
        全局坐标 bounds, 且结果自带“从前到后”的 z 序 -> 用于确定“当前窗口”。
-    2) “当前窗口”直接取 CGWindowList z 序最靠前的窗口 (用户眼前的最上面一页)。
-       注意: 不能用 NSWorkspace.frontmostApplication() —— 在没有 RunLoop 的
-       脚本进程里它是陈旧快照, 不会随窗口切换刷新, 会导致当前窗口判定错乱、
-       每次都切到同一个目标; CGWindowList 的 z 序是窗口服务器的实时状态。
-    3) ApplicationServices (HIServices) 的 Accessibility API: 在目标应用内按
-       位置/大小匹配到具体窗口后执行 AXRaise, 再置 AXFrontmost —— 同一应用开了
-       多个窗口 (如 Chrome 多窗口) 时也能准确抬升目标窗口, 而不是只激活应用。
-    4) 失败兜底: 每次切换后都用 z 序实时确认目标窗口真的到了最前, 未确认则
-       依次退回 osascript (System Events)、open -b (LaunchServices)、
-       NSRunningApplication.activateWithOptions_。
+       注意: 不能用 NSWorkspace.frontmostApplication() —— 无 RunLoop 的脚本
+       进程里它是陈旧快照, 不会随窗口切换刷新; CGWindowList 的 z 序才是窗口
+       服务器的实时状态。CGGetActiveDisplayList + CGDisplayBounds 提供各显示器
+       bounds, 用于“几乎铺满某块显示器”的兜底判定 (多显示器坐标可能为负)。
+    2) ApplicationServices (HIServices) -- Accessibility API
+       AXUIElementCreateApplication / AXUIElementCopyAttributeValue /
+       AXUIElementSetAttributeValue / AXUIElementPerformAction /
+       AXValueGetValue / AXIsProcessTrusted: 在目标应用内按位置/大小匹配到具体
+       窗口后执行 AXRaise, 再置 AXFrontmost —— 同一应用开了多个窗口 (如 Chrome
+       多窗口) 时也能准确抬升目标窗口, 而不是只激活应用。AXFullScreen /
+       AXSubrole 用于铺满全屏判定。
+       权限: 与 pynput 键盘监听相同, 需在 系统设置 -> 隐私与安全性 -> 辅助功能
+       里给运行脚本的终端/IDE 授权 (pynput 已授权则复用同一份授权)。
+    3) AppKit (Cocoa)
+       NSRunningApplication.activateWithOptions_(
+       NSApplicationActivateIgnoringOtherApps): 最后一级激活兜底。它依赖 RunLoop
+       维护运行列表, 无 RunLoop 的脚本进程里经常查不到目标, 只作兜底不作主链路。
+    4) CoreFoundation
+       kCFBooleanTrue: 写 AXFrontmost 属性时使用的 CFBoolean 常量。
+    5) 兜底子进程
+       osascript + System Events (Apple 事件): 置前应用并抬升匹配窗口, 也可查
+       bundle id (需要“自动化”权限, 与辅助功能相互独立, 失败不影响主链路)。
+       open -b <bundle-id> / -a <应用名>: 走 LaunchServices 激活, 不需要 TCC 授权。
 
-权限: 与 pynput 键盘监听相同, 需要在 系统设置 -> 隐私与安全性 -> 辅助功能
-里给运行本脚本的终端/IDE 授权 (pynput 监听已授权的话, 这里直接复用同一份授权)。
+失败兜底链 (focus_window): AX API -> osascript (System Events) -> open
+(LaunchServices) -> NSRunningApplication; 每级“声称成功”后都用 z 序实时确认
+目标窗口真的到了最前, 未确认则自动换下一级。
 
 已知边界 (有意保持简单): 只在当前 Space 内切换; 已最小化的窗口不参与切换
 (OnScreenOnly 不会返回它们); 切到全屏窗口时系统会自动做 Space 切换。
-
-铺满全屏优先 (fullscreen_only, 可在 config/config.yaml 里用 True/False 开关):
-当屏幕上存在“铺满全屏”的窗口 (原生全屏, 或 Split View 左右分屏铺满) 时, 忽略
-其之下的其他普通窗口, shift+a/d 只在铺满的窗口之间切换 —— 避免从分屏层切到
-底下的应用时被整屏切走、破坏分屏观感。判定依据: AX 的 AXFullScreen 属性
-(原生全屏与 Split View 两半都会返回 True), 兜底为 AXSubrole == AXFullScreen、
-或窗口 bounds 几乎完全覆盖某块显示器。开关读取自 <项目根>/config/config.yaml
-(本文件向上查找), 形如:
-    fullscreen_only: True
-键可写在 yaml 任意层级; 缺省视为 True (文件缺失或解析失败都用缺省值);
-每次按键都会重新读取, 改动即时生效, 无需重启监听。
-
-实现只依赖 pynput 在 macOS 上自带的 pyobjc (Quartz/AppKit/ApplicationServices),
-不引入新的第三方依赖。
+不同 pyobjc 版本的绑定差异 (AX 函数是否保留 out 参数、AXValue 的桥接形式等)
+都在本文件内部的兼容封装里消化, 不外泄到上层。
 """
 
 import os
 import subprocess
 import time
 
+# ===========================================================================
+# 区域 1: macOS API 导入与可用性探测
 # ---------------------------------------------------------------------------
-# macOS API 导入 (pynput 在 macOS 上已依赖 pyobjc, 这里直接复用, 不新增依赖)
-# ---------------------------------------------------------------------------
+# pyobjc 按框架拆分绑定:
+#   Quartz              -> CoreGraphics 窗口服务 (CGWindowList / CGDisplay)
+#   AppKit              -> Cocoa (NSRunningApplication 激活兜底)
+#   ApplicationServices -> HIServices 的 Accessibility API (窗口枚举/置前)
+#   CoreFoundation      -> kCFBooleanTrue (AXFrontmost 属性写入常量)
+# 任一导入失败都只降级不崩溃: 对应 *_OK 置 False, 上层据此提示并跳过相应链路,
+# 诊断模式也依赖这两个标志报告真实可用性。
+# ===========================================================================
+
 try:
     import Quartz                                          # pyobjc-framework-Quartz
     from AppKit import NSRunningApplication                # pyobjc-framework-Cocoa
-    _QUARTZ_OK = True
+    QUARTZ_OK = True
 except Exception:                                          # pragma: no cover
     Quartz = NSRunningApplication = None
-    _QUARTZ_OK = False
+    QUARTZ_OK = False
 
 try:
     from AppKit import NSApplicationActivateIgnoringOtherApps
@@ -80,11 +92,32 @@ try:
         AXIsProcessTrusted,
     )
     from CoreFoundation import kCFBooleanTrue
-    _AX_OK = True
+    AX_OK = True
 except Exception:                                          # pragma: no cover
-    _AX_OK = False
+    AX_OK = False
 
-# AX 常量直接写成字符串/数值, 规避不同 pyobjc 版本导出差异
+__all__ = [
+    'QUARTZ_OK', 'AX_OK',
+    'list_visible_windows', 'mark_fullscreen_windows',
+    'focus_window', 'run_diagnostics',
+]
+
+
+# ===========================================================================
+# 区域 2: AX 属性常量与窗口过滤参数
+# ---------------------------------------------------------------------------
+# AX 常量直接写成字符串/数值, 规避不同 pyobjc 版本导出差异:
+#   AXWindows / AXPosition / AXSize / AXFrontmost -- AX 属性名
+#       (AXFrontmost: 置 True 把应用整体置前; AXRaise 只在应用内部排序窗口)
+#   AXRaise       -- 可以对 AX 窗口执行的动作名
+#   kAXValueCGPointType(1) / kAXValueCGSizeType(2) -- AXValueGetValue 类型常量,
+#       用于把 AXPosition/AXSize 的 AXValue 拆成数值对
+#   AXFullScreen / AXSubrole == AXFullScreen -- 铺满全屏判定 (原生全屏与
+#       Split View 左右分屏的两半都返回 True)
+# 过滤参数: _MIN_WINDOW_* 排除输入法候选框之类的迷你窗口和几乎透明的辅助窗口;
+# _AX_MATCH_TOLERANCE: CGWindowBounds 与 AX 窗口位置/大小匹配的容差 (pt)。
+# ===========================================================================
+
 _AX_WINDOWS_ATTR = 'AXWindows'
 _AX_POSITION_ATTR = 'AXPosition'
 _AX_SIZE_ATTR = 'AXSize'
@@ -97,87 +130,36 @@ _AX_FULLSCREEN_ATTR = 'AXFullScreen'      # 窗口是否处于全屏/分屏(Spli
 _AX_SUBROLE_ATTR = 'AXSubrole'
 _AX_SUBROLE_FULLSCREEN = 'AXFullScreen'   # 全屏窗口的 subrole (兜底判定)
 
-# 过滤参数: 排除输入法候选框之类的迷你窗口和几乎透明的辅助窗口
 _MIN_WINDOW_WIDTH = 120
 _MIN_WINDOW_HEIGHT = 80
 _MIN_WINDOW_ALPHA = 0.05
-# CGWindowBounds 与 AX 窗口位置匹配的容差 (pt)
 _AX_MATCH_TOLERANCE = 24.0
 
+
+# ===========================================================================
+# 区域 3: Quartz -- 窗口列表 / z 序确认 / 显示器 bounds
 # ---------------------------------------------------------------------------
-# 可选配置接口 (config/config.yaml)
-#   fullscreen_only: True/False
-#   存在铺满全屏的窗口时, 是否忽略其之下的普通窗口 (True=忽略, 只切铺满窗口)
-# ---------------------------------------------------------------------------
-_CONFIG_RELATIVE_PATH = ('config', 'config.yaml')
-_FULLSCREEN_FILTER_KEY = 'fullscreen_only'
-_FULLSCREEN_FILTER_DEFAULT = True
-_TRUE_VALUES = ('true', 'yes', 'on', '1')
-_FALSE_VALUES = ('false', 'no', 'off', '0')
+# 系统 API:
+#   Quartz.CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly |
+#       kCGWindowListExcludeDesktopElements, kCGNullWindowID)
+#       一次调用拿到当前 Space 内全部可见窗口的 pid/应用名/全局坐标 bounds,
+#       返回顺序就是窗口服务器的实时 z 序 (前 -> 后), windows[0] 即“当前窗口”;
+#       kCGWindowLayer == 0 只保留普通窗口, 排除菜单栏/Dock/悬浮提示等。
+#       它是无 RunLoop 脚本进程里唯一可靠的“当前窗口”来源。
+#   Quartz.CGGetActiveDisplayList + Quartz.CGDisplayBounds
+#       所有活动显示器的 bounds (CG 全局坐标系, 原点在主显示器左上角,
+#       其他显示器按系统排列可能出现负坐标), 供“窗口几乎铺满某块显示器”
+#       的兜底判定。
+# ===========================================================================
 
-
-# ---------------------------------------------------------------------------
-# 配置读取 (config/config.yaml -> fullscreen_only: True/False)
-# ---------------------------------------------------------------------------
-def _find_config_file():
-    """从本文件所在目录向上查找 <项目根>/config/config.yaml; 找不到返回 None。"""
-    try:
-        current = os.path.dirname(os.path.abspath(__file__))
-    except NameError:                                  # pragma: no cover
-        return None
-    for _ in range(6):
-        candidate = os.path.join(current, *_CONFIG_RELATIVE_PATH)
-        if os.path.isfile(candidate):
-            return candidate
-        parent = os.path.dirname(current)
-        if parent == current:
-            break
-        current = parent
-    return None
-
-
-def _load_fullscreen_filter_enabled():
-    """读取 fullscreen_only 开关; 缺省 True, 改 config 后即时生效、无需重启。
-
-    轻量解析, 不依赖 PyYAML: 值支持 true/false/yes/no/on/off/1/0 (大小写不敏感,
-    可带引号), 行内 # 注释会被忽略; 键写在 yaml 任意层级都能匹配 (先到先得)。
-    文件缺失或解析失败时回退缺省值。
-    """
-    path = _find_config_file()
-    if path is None:
-        return _FULLSCREEN_FILTER_DEFAULT
-    try:
-        with open(path, 'r', encoding='utf-8') as fh:
-            text = fh.read()
-    except Exception:
-        return _FULLSCREEN_FILTER_DEFAULT
-    for line in text.splitlines():
-        stripped = line.split('#', 1)[0].strip()
-        if ':' not in stripped:
-            continue
-        key, _, raw = stripped.partition(':')
-        if key.strip().strip('"\'').lower() != _FULLSCREEN_FILTER_KEY:
-            continue
-        value = raw.strip().strip('"\'').lower()
-        if value in _TRUE_VALUES:
-            return True
-        if value in _FALSE_VALUES:
-            return False
-        break                      # 键存在但值无法识别 -> 用缺省值
-    return _FULLSCREEN_FILTER_DEFAULT
-
-
-# ---------------------------------------------------------------------------
-# shift + a / shift + d 的支撑函数
-# ---------------------------------------------------------------------------
-def _list_visible_windows():
+def list_visible_windows():
     """收集当前 Space 内所有可见的普通窗口, 按 CGWindowList 原生 z 序(前->后)返回。
 
     元素字段: pid / owner / number / x / y / w / h
     坐标为 CG 全局坐标系 (pt): 主显示器左上角为原点, 其他显示器按系统设置的
     排列可能出现负坐标, 因此天然覆盖多显示器。
     """
-    if not _QUARTZ_OK:
+    if not QUARTZ_OK:
         return []
     options = (Quartz.kCGWindowListOptionOnScreenOnly
                | Quartz.kCGWindowListExcludeDesktopElements)
@@ -208,10 +190,83 @@ def _list_visible_windows():
             'y': float(bounds.get('Y', 0.0)),
             'w': width,
             'h': height,
-            'fullscreen': False,    # 是否铺满全屏, 由 _mark_fullscreen_windows 标记
+            'fullscreen': False,    # 是否铺满全屏, 由 mark_fullscreen_windows 标记
         })
     return windows
 
+
+def _display_bounds_list():
+    """所有活动显示器的 bounds (CG 全局坐标系); 拿不到时返回空列表。"""
+    if not QUARTZ_OK:
+        return []
+    try:
+        raw = Quartz.CGGetActiveDisplayList(16, None, None)
+        display_ids = []
+        if isinstance(raw, (list, tuple)):
+            inner = [part for part in raw if isinstance(part, (list, tuple))]
+            if inner:
+                for part in inner:
+                    display_ids.extend(int(d) for d in part)
+            else:
+                display_ids.extend(int(d) for d in raw)
+    except Exception:
+        return []
+    bounds_list = []
+    for display_id in display_ids:
+        try:
+            display_bounds = Quartz.CGDisplayBounds(display_id)
+            bounds_list.append((float(display_bounds.origin.x),
+                                float(display_bounds.origin.y),
+                                float(display_bounds.size.width),
+                                float(display_bounds.size.height)))
+        except Exception:
+            continue
+    return bounds_list
+
+
+def _is_window_top(target):
+    """检查目标窗口现在是否就是全屏幕 z 序最靠前的窗口 (实时查 CGWindowList)。"""
+    if not QUARTZ_OK:
+        return False
+    options = (Quartz.kCGWindowListOptionOnScreenOnly
+               | Quartz.kCGWindowListExcludeDesktopElements)
+    raw = Quartz.CGWindowListCopyWindowInfo(options, Quartz.kCGNullWindowID)
+    for item in raw or []:
+        if int(item.get(Quartz.kCGWindowLayer, 1)) != 0:
+            continue
+        # 第一个 layer 0 窗口就是 z 序最靠前的窗口
+        return (int(item.get(Quartz.kCGWindowOwnerPID, -1)) == int(target['pid'])
+                and int(item.get(Quartz.kCGWindowNumber, -2)) == int(target['number']))
+    return False
+
+
+def _wait_until_window_top(target, timeout=0.6, interval=0.05):
+    """轮询确认目标窗口已成为 z 序最前 (实时 CGWindowList, 无 RunLoop 依赖)。"""
+    deadline = time.monotonic() + timeout
+    while True:
+        if _is_window_top(target):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(interval)
+
+
+# ===========================================================================
+# 区域 4: Accessibility (AX) -- 属性读写 / 窗口枚举 / 全屏判定 / 抬升置前
+# ---------------------------------------------------------------------------
+# 系统 API (ApplicationServices / HIServices, 需“辅助功能”授权):
+#   AXUIElementCreateApplication(pid)      -- 创建目标应用的 AX 元素
+#   AXUIElementCopyAttributeValue          -- 读 AXWindows/AXPosition/AXSize/
+#                                             AXFullScreen/AXSubrole 等属性
+#   AXUIElementSetAttributeValue           -- 写 AXFrontmost 把应用整体置前
+#   AXUIElementPerformAction(w, "AXRaise") -- 抬升应用内指定窗口: 同一应用开了
+#       多个窗口 (如 Chrome 多窗口) 时也能准确抬升目标窗口, 而不是只激活应用
+#   AXValueGetValue                        -- 把 AXValue 拆成数值对 (兼容封装见下)
+#   AXIsProcessTrusted                     -- 查询“辅助功能”授权状态 (诊断用)
+# 铺满判定优先级: AXFullScreen 明确给出值 -> 直接信任 (含 False);
+# 兜底 AXSubrole == AXFullScreen; 再兜底“bounds 几乎覆盖某块显示器”的纯几何判定
+# (普通最大化窗口会被菜单栏挡住差出几十 pt, 不会误判)。
+# ===========================================================================
 
 def _ax_copy_attribute(element, attribute):
     """AXUIElementCopyAttributeValue 的兼容封装, 统一返回 (AXError, value)。
@@ -252,57 +307,12 @@ def _axvalue_to_pair(value, is_point):
     return None
 
 
-def _display_bounds_list():
-    """所有活动显示器的 bounds (CG 全局坐标系); 拿不到时返回空列表。"""
-    if not _QUARTZ_OK:
-        return []
-    try:
-        raw = Quartz.CGGetActiveDisplayList(16, None, None)
-        display_ids = []
-        if isinstance(raw, (list, tuple)):
-            inner = [part for part in raw if isinstance(part, (list, tuple))]
-            if inner:
-                for part in inner:
-                    display_ids.extend(int(d) for d in part)
-            else:
-                display_ids.extend(int(d) for d in raw)
-    except Exception:
-        return []
-    bounds_list = []
-    for display_id in display_ids:
-        try:
-            display_bounds = Quartz.CGDisplayBounds(display_id)
-            bounds_list.append((float(display_bounds.origin.x),
-                                float(display_bounds.origin.y),
-                                float(display_bounds.size.width),
-                                float(display_bounds.size.height)))
-        except Exception:
-            continue
-    return bounds_list
-
-
-def _looks_fullscreen_by_bounds(bounds, displays):
-    """兜底判定: 窗口几乎完全覆盖某块显示器 (连菜单栏区域一起盖住) => 全屏。
-
-    普通的最大化/缩放窗口会被菜单栏挡住而差出几十个 pt, 不会误判; 只用于
-    应用不提供 AXFullScreen 属性时的兜底。
-    """
-    if not bounds or not displays:
-        return False
-    x, y, width, height = bounds
-    for dx, dy, display_width, display_height in displays:
-        if (width >= display_width - 2 and height >= display_height - 2
-                and abs(x - dx) <= 2 and abs(y - dy) <= 2):
-            return True
-    return False
-
-
 def _ax_window_infos(pid):
     """拿应用 pid 的全部 AX 窗口及其位置/大小; 失败返回空列表。
 
     返回元素: {'element': AX窗口对象, 'pos': (x, y), 'size': (w, h)}
     """
-    if not _AX_OK:
+    if not AX_OK:
         return []
     try:
         app = AXUIElementCreateApplication(int(pid))
@@ -323,6 +333,22 @@ def _ax_window_infos(pid):
         return infos
     except Exception:
         return []
+
+
+def _looks_fullscreen_by_bounds(bounds, displays):
+    """兜底判定: 窗口几乎完全覆盖某块显示器 (连菜单栏区域一起盖住) => 全屏。
+
+    普通的最大化/缩放窗口会被菜单栏挡住而差出几十个 pt, 不会误判; 只用于
+    应用不提供 AXFullScreen 属性时的兜底。
+    """
+    if not bounds or not displays:
+        return False
+    x, y, width, height = bounds
+    for dx, dy, display_width, display_height in displays:
+        if (width >= display_width - 2 and height >= display_height - 2
+                and abs(x - dx) <= 2 and abs(y - dy) <= 2):
+            return True
+    return False
 
 
 def _ax_fullscreen_flag(ax_window, cg_bounds, displays):
@@ -357,41 +383,44 @@ def _match_window_by_bounds(cg_bounds, ax_infos):
     return best
 
 
-def _mark_fullscreen_windows(windows):
-    """为窗口列表就地标记“铺满全屏”状态 (原生全屏或 Split View 分屏铺满)。
+def _ax_raise_and_focus(pid, bounds):
+    """用 Accessibility API 抬升目标窗口并把应用置前, 成功返回 True。"""
+    if not AX_OK:
+        return False
+    try:
+        # 1) 在目标应用的所有窗口里, 按“位置 + 大小”找与 CGWindowBounds 最接近
+        #    的那个窗口并 AXRaise —— 同一应用开了多个窗口 (如 Chrome 多窗口) 时
+        #    也能切到指定窗口, 而不是只把应用整体调到最前。
+        target_window = _match_window_by_bounds(bounds, _ax_window_infos(pid))
+        if target_window is not None:
+            AXUIElementPerformAction(target_window['element'], _AX_RAISE_ACTION)
 
-    返回被标记为铺满的窗口数量。AX 不可用时退化为纯 bounds 判定
-    (此时只能识别覆盖整块显示器的原生全屏)。
-    """
-    if not windows:
-        return 0
-    displays = _display_bounds_list()
-    if not _AX_OK:
-        marked = 0
-        for win in windows:
-            if _looks_fullscreen_by_bounds(
-                    (win['x'], win['y'], win['w'], win['h']), displays):
-                win['fullscreen'] = True
-                marked += 1
-        return marked
-    groups = {}
-    for win in windows:
-        groups.setdefault(win['pid'], []).append(win)
-    marked = 0
-    for pid, group in groups.items():
-        ax_infos = _ax_window_infos(pid)
-        if not ax_infos:
-            continue
-        for win in group:
-            bounds = (win['x'], win['y'], win['w'], win['h'])
-            match = _match_window_by_bounds(bounds, ax_infos)
-            if match is None:
-                continue
-            if _ax_fullscreen_flag(match['element'], bounds, displays):
-                win['fullscreen'] = True
-                marked += 1
-    return marked
+        # 2) 把应用整体置前 (AXRaise 只在应用内部排序, 不会激活后台应用)
+        app = AXUIElementCreateApplication(int(pid))
+        if AXUIElementSetAttributeValue(app, _AX_FRONTMOST_ATTR, kCFBooleanTrue) == 0:
+            return True
+        return _activate_with_nsrunning(int(pid))
+    except Exception:
+        return False
 
+
+# ===========================================================================
+# 区域 5: 激活兜底 -- NSRunningApplication / osascript / open
+# ---------------------------------------------------------------------------
+# 系统 API:
+#   AppKit.NSRunningApplication.runningApplicationWithProcessIdentifier_(pid)
+#       查 pid 对应的运行应用 (拿 bundle id / 激活)。依赖 RunLoop 维护运行
+#       列表, 无 RunLoop 的脚本进程里经常查不到, 因此每一处都有非 AppKit 兜底。
+#   NSApplicationActivateIgnoringOtherApps
+#       activateWithOptions_ 的选项: 即使目标不是当前应用也强制激活。
+#   osascript + "System Events" (Apple 事件 / 自动化权限)
+#       1) 查 bundle id: first application process whose unix id is <pid>
+#       2) 置前 + 抬升窗口: set frontmost of _proc to true; 对 position/size
+#          匹配的窗口 perform action "AXRaise"
+#       与“辅助功能”权限相互独立, 失败不影响 AX 主链路。
+#   open -b <bundle-id> / -a <应用名> (LaunchServices)
+#       不需要任何 TCC 授权的激活方式, 作为 AX 与 osascript 都失败时的兜底。
+# ===========================================================================
 
 def _bundle_id_for_pid(pid):
     """拿 pid 对应应用的 bundle id。
@@ -399,7 +428,7 @@ def _bundle_id_for_pid(pid):
     NSRunningApplication 依赖 RunLoop 维护运行列表, 在无 RunLoop 的脚本进程里
     经常查不到 (诊断 [8] 未找到的同族问题), 因此再用 System Events 兜底一次。
     """
-    if _QUARTZ_OK:
+    if QUARTZ_OK:
         try:
             app = NSRunningApplication.runningApplicationWithProcessIdentifier_(
                 int(pid))
@@ -440,34 +469,13 @@ def _activate_with_open(pid, owner_name=None):
 
 def _activate_with_nsrunning(pid):
     """兜底: 用 NSRunningApplication 把目标应用激活。"""
-    if not _QUARTZ_OK:
+    if not QUARTZ_OK:
         return False
     try:
         app = NSRunningApplication.runningApplicationWithProcessIdentifier_(int(pid))
         if app is None:
             return False
         return bool(app.activateWithOptions_(NSApplicationActivateIgnoringOtherApps))
-    except Exception:
-        return False
-
-
-def _ax_raise_and_focus(pid, bounds):
-    """用 Accessibility API 抬升目标窗口并把应用置前, 成功返回 True。"""
-    if not _AX_OK:
-        return False
-    try:
-        # 1) 在目标应用的所有窗口里, 按“位置 + 大小”找与 CGWindowBounds 最接近
-        #    的那个窗口并 AXRaise —— 同一应用开了多个窗口 (如 Chrome 多窗口) 时
-        #    也能切到指定窗口, 而不是只把应用整体调到最前。
-        target_window = _match_window_by_bounds(bounds, _ax_window_infos(pid))
-        if target_window is not None:
-            AXUIElementPerformAction(target_window['element'], _AX_RAISE_ACTION)
-
-        # 2) 把应用整体置前 (AXRaise 只在应用内部排序, 不会激活后台应用)
-        app = AXUIElementCreateApplication(int(pid))
-        if AXUIElementSetAttributeValue(app, _AX_FRONTMOST_ATTR, kCFBooleanTrue) == 0:
-            return True
-        return _activate_with_nsrunning(int(pid))
     except Exception:
         return False
 
@@ -500,34 +508,55 @@ end tell
         return False
 
 
-def _is_window_top(target):
-    """检查目标窗口现在是否就是全屏幕 z 序最靠前的窗口 (实时查 CGWindowList)。"""
-    if not _QUARTZ_OK:
-        return False
-    options = (Quartz.kCGWindowListOptionOnScreenOnly
-               | Quartz.kCGWindowListExcludeDesktopElements)
-    raw = Quartz.CGWindowListCopyWindowInfo(options, Quartz.kCGNullWindowID)
-    for item in raw or []:
-        if int(item.get(Quartz.kCGWindowLayer, 1)) != 0:
+# ===========================================================================
+# 区域 6: 编排层 -- 铺满标记与焦点切换 (对上层的稳定入口)
+# ---------------------------------------------------------------------------
+# mark_fullscreen_windows: 先用 Quartz 拿显示器 bounds, 再按 pid 分组走 AX
+#   枚举 + bounds 匹配, 就地给窗口 dict 打 fullscreen 标记 (纯 Python 数据,
+#   AX 元素不出本文件)。AX 不可用时退化为纯 bounds 判定。
+# focus_window: 完整兜底链, 每级“声称成功”后都用 z 序实时确认:
+#   AX API -> osascript (System Events) -> open (LaunchServices)
+#   -> NSRunningApplication。某一级没有真的把目标窗口带到最前就自动换下一级
+#   —— 否则下一次按键会以错误的“当前窗口”计算邻居, 表现为切不到预期目标。
+# ===========================================================================
+
+def mark_fullscreen_windows(windows):
+    """为窗口列表就地标记“铺满全屏”状态 (原生全屏或 Split View 分屏铺满)。
+
+    返回被标记为铺满的窗口数量。AX 不可用时退化为纯 bounds 判定
+    (此时只能识别覆盖整块显示器的原生全屏)。
+    """
+    if not windows:
+        return 0
+    displays = _display_bounds_list()
+    if not AX_OK:
+        marked = 0
+        for win in windows:
+            if _looks_fullscreen_by_bounds(
+                    (win['x'], win['y'], win['w'], win['h']), displays):
+                win['fullscreen'] = True
+                marked += 1
+        return marked
+    groups = {}
+    for win in windows:
+        groups.setdefault(win['pid'], []).append(win)
+    marked = 0
+    for pid, group in groups.items():
+        ax_infos = _ax_window_infos(pid)
+        if not ax_infos:
             continue
-        # 第一个 layer 0 窗口就是 z 序最靠前的窗口
-        return (int(item.get(Quartz.kCGWindowOwnerPID, -1)) == int(target['pid'])
-                and int(item.get(Quartz.kCGWindowNumber, -2)) == int(target['number']))
-    return False
+        for win in group:
+            bounds = (win['x'], win['y'], win['w'], win['h'])
+            match = _match_window_by_bounds(bounds, ax_infos)
+            if match is None:
+                continue
+            if _ax_fullscreen_flag(match['element'], bounds, displays):
+                win['fullscreen'] = True
+                marked += 1
+    return marked
 
 
-def _wait_until_window_top(target, timeout=0.6, interval=0.05):
-    """轮询确认目标窗口已成为 z 序最前 (实时 CGWindowList, 无 RunLoop 依赖)。"""
-    deadline = time.monotonic() + timeout
-    while True:
-        if _is_window_top(target):
-            return True
-        if time.monotonic() >= deadline:
-            return False
-        time.sleep(interval)
-
-
-def _focus_window(target):
+def focus_window(target):
     """把目标窗口带到最前, 并用 z 序实时确认切换真的生效。
 
     依次尝试: AX API -> osascript (System Events) -> open (LaunchServices)
@@ -548,95 +577,15 @@ def _focus_window(target):
     return False
 
 
-def _switch_window(direction, label):
-    """在按 X 坐标“从左到右”排序的可见窗口里, 把焦点移到当前窗口相邻的窗口。
-
-    direction: -1 = 左边相邻窗口 (shift+a), +1 = 右边相邻窗口 (shift+d)。
-    不循环: 已在最左再按 a、已在最右再按 d, 都不做任何切换。
-    """
-    if not _QUARTZ_OK:
-        print('[%s] 缺少 pyobjc (Quartz/AppKit)。pynput 在 macOS 上会自动安装它,'
-              '请检查当前 Python 环境' % label)
-        return
-
-    windows = _list_visible_windows()
-    if len(windows) < 2:
-        print('[%s] 屏幕上可见的普通窗口不足 2 个, 无需切换' % label)
-        return
-
-    # fullscreen_only (config/config.yaml): 存在铺满全屏的窗口 (原生全屏或
-    # Split View 分屏) 时, 忽略其之下的普通窗口, 只在铺满的窗口之间切换,
-    # 避免从分屏层切到底下的应用时被整屏切走。
-    filtered = False
-    if _load_fullscreen_filter_enabled():
-        _mark_fullscreen_windows(windows)
-        fullscreen_windows = [w for w in windows if w.get('fullscreen')]
-        if fullscreen_windows and len(fullscreen_windows) < len(windows):
-            windows = fullscreen_windows
-            filtered = True
-        if filtered and len(windows) < 2:
-            print('[%s] 铺满全屏的窗口不足 2 个, 按 fullscreen_only 规则不切换' % label)
-            return
-
-    # “当前窗口” = z 序最靠前的窗口 (用户眼前的最上面一页)。
-    # 注意: 不能用 NSWorkspace.frontmostApplication() —— 在没有 RunLoop 的脚本
-    # 进程里它是陈旧快照, 不会随窗口切换刷新, 会导致当前窗口判定错乱
-    # (日志表现为当前窗口一直是同一个、每次都切到同一个目标)。
-    current = windows[0]           # _list_visible_windows 保持 z 序 (前 -> 后)
-
-    # 按窗口左上角 X 坐标从左到右排序 (跨内建屏/外接屏同样适用), X 相同再按 Y
-    ordered = sorted(windows, key=lambda win: (win['x'], win['y'], win['number']))
-    index = ordered.index(current)
-    # 不循环: 直接取相邻索引, 越过两端即不切换 (替代原 % len 的循环写法)
-    target_index = index + direction
-    if target_index < 0 or target_index >= len(ordered):
-        edge = '最左' if direction < 0 else '最右'
-        print('[%s] %s (pid %s) 已是%s侧窗口, 不切换' % (
-            label, current['owner'], current['pid'], edge))
-        return
-    target = ordered[target_index]
-
-    if target is current:
-        return
-
-    arrow = '←' if direction < 0 else '→'
-    current_tag = '[铺满] ' if current.get('fullscreen') else ''
-    target_tag = '[铺满] ' if target.get('fullscreen') else ''
-    print('[%s] %s%s (pid %s) %s %s%s (pid %s)  x=%.0f, y=%.0f, %.0fx%.0f' % (
-        label, current_tag, current['owner'], current['pid'], arrow,
-        target_tag, target['owner'], target['pid'], target['x'], target['y'],
-        target['w'], target['h']))
-
-    if not _focus_window(target):
-        print('[%s] 切换失败 (目标: %s, pid %s)。请在运行监听脚本的同一终端里执行 '
-              '"python src/actions/simple_actions.py" 查看是哪一环失败; 最常见原因是 '
-              '系统设置 -> 隐私与安全性 -> 辅助功能 没有授予运行脚本的终端/IDE' % (
-                  label, target['owner'], target['pid']))
-
-
+# ===========================================================================
+# 区域 7: 诊断模式 -- 逐环自检切换链路 (排障用, 供 simple_actions 入口调用)
 # ---------------------------------------------------------------------------
-# 快捷键动作 (键盘监控部分调用下面这些函数, 签名保持不变)
-# ---------------------------------------------------------------------------
-def on_activate_w():
-    print('shift + w')
+# 依次检查: 模块可用性 -> AXIsProcessTrusted 授权 -> CGWindowList 实时窗口 ->
+# AX 读 AXWindows / 写 AXFrontmost 的真实返回码 -> osascript + System Events
+# (自动化权限) -> NSRunningApplication 查询 (无 RunLoop 查不到属正常), 最后
+# 汇总问题清单。_AX_ERROR_NAMES 把 AXError 负数错误码翻译成可读名称。
+# ===========================================================================
 
-def on_activate_a():
-    """shift+a: 切到当前窗口左边相邻的窗口 (已在最左则不切换)。"""
-    _switch_window(direction=-1, label='shift+a')
-
-def on_activate_s():
-    print('shift + s')
-
-def on_activate_d():
-    """shift+d: 切到当前窗口右边相邻的窗口 (已在最右则不切换)。"""
-    _switch_window(direction=+1, label='shift+d')
-
-
-# ---------------------------------------------------------------------------
-# 诊断模式: 直接运行本文件, 在与监听脚本相同的环境里自检切换链路
-#   python src/actions/simple_actions.py            # 只读检查
-#   python src/actions/simple_actions.py 目标pid    # 只读检查 + 实测切换到该应用
-# ---------------------------------------------------------------------------
 _AX_ERROR_NAMES = {
     0: '成功',
     -25200: 'kAXErrorFailure',
@@ -650,18 +599,18 @@ _AX_ERROR_NAMES = {
 }
 
 
-def _print_diagnostics(target_pid=None):
+def run_diagnostics(target_pid=None):
     """打印授权与切换链路每一环的真实状态, 用于定位“切换失败”。"""
     print('== simple_actions 诊断 ==')
-    print('[1] 模块可用性: Quartz=%s, AX API=%s' % (_QUARTZ_OK, _AX_OK))
+    print('[1] 模块可用性: Quartz=%s, AX API=%s' % (QUARTZ_OK, AX_OK))
     trusted = False
-    if _AX_OK:
+    if AX_OK:
         trusted = bool(AXIsProcessTrusted())
         print('[2] 辅助功能授权 AXIsProcessTrusted: %s' % trusted)
-    if not _QUARTZ_OK:
+    if not QUARTZ_OK:
         print('!! Quartz 不可用, 诊断终止')
         return
-    windows = _list_visible_windows()
+    windows = list_visible_windows()
     print('[3] CGWindowList 实时窗口 (前->后, 共 %d 个):' % len(windows))
     for win in windows[:8]:
         print('      %s (pid %s, #%s, x=%.0f y=%.0f)' % (
@@ -678,7 +627,7 @@ def _print_diagnostics(target_pid=None):
     ax_set_err = None
     switched = None
     problems = []
-    if _AX_OK:
+    if AX_OK:
         if not trusted:
             print('[5] 跳过 AX 实测 (辅助功能未授权)')
             problems.append('辅助功能未授权 ([2]=False): 请在 系统设置 -> 隐私与安全性 '
@@ -695,7 +644,7 @@ def _print_diagnostics(target_pid=None):
                 print('[6] AX 置 AXFrontmost: err=%s (%s)' % (
                     ax_set_err, _AX_ERROR_NAMES.get(ax_set_err, '未知错误')))
                 time.sleep(0.5)
-                top = _list_visible_windows()
+                top = list_visible_windows()
                 switched = bool(top) and top[0]['pid'] == target['pid']
                 print('    实测结果: z 序最前 = %s (pid %s)%s' % (
                     top[0]['owner'] if top else '?',
@@ -717,7 +666,7 @@ def _print_diagnostics(target_pid=None):
             ((result.stderr or '').strip() or '无')[:160]))
     except Exception as exc:
         print('[7] osascript 异常: %r' % (exc,))
-    if _QUARTZ_OK:
+    if QUARTZ_OK:
         try:
             app = NSRunningApplication.runningApplicationWithProcessIdentifier_(
                 int(target['pid']))
@@ -746,8 +695,3 @@ def _print_diagnostics(target_pid=None):
     else:
         print('切换链路全部正常, 可以直接使用 shift+a/d; 若监听脚本还在运行旧代码, '
               '请重启 main.py 后再试。')
-
-
-if __name__ == '__main__':
-    import sys as _sys
-    _print_diagnostics(_sys.argv[1] if len(_sys.argv) > 1 else None)

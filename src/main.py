@@ -1,6 +1,6 @@
 import paths
 from pynput import keyboard
-from actions.simple_actions import *
+from keyboards.keyboard import *
 from config.config_loader import load_config
 
 HOTKEYS = load_config()["hotkeys"]
@@ -23,5 +23,3 @@ with keyboard.GlobalHotKeys({
         }) as h:
     h.join()
 
-
-    
