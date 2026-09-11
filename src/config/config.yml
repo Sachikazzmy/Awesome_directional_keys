@@ -10,5 +10,10 @@ hotkeys:
   
   right: "<shift>+d"
 
-  fullscreen_only: True  
-  # True=有铺满全屏窗口时只在这些窗口间切换; False=恢复旧行为(全量切换)
+
+fullscreen_only: True  
+# True=有铺满全屏窗口时只在这些窗口间切换; False=恢复旧行为(全量切换)
+
+
+scroll_unit: "pixel"   # 'pixel'(缺省) 按像素, 跨应用距离一致 / 'line' 按"行"(传统滚轮语义)
+scroll_amount: 300     # 每次滚动量: pixel 缺省 500(约小半屏) / line 缺省 5

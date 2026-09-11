@@ -3,12 +3,22 @@
 window_api.py -- macos/ 平台层唯一文件 (单文件精简版): 本项目所有 macOS 系统
 API 的导入与调用都集中在这里, 用分隔线划分区域职能。
 
-上层 actions/simple_actions.py 只使用本文件暴露的纯 Python 接口, 不再出现任何
-pyobjc / 子进程细节:
+上层 actions/ 层只使用本文件暴露的纯 Python 接口, 不出现任何 pyobjc / 子进程细节:
     QUARTZ_OK / AX_OK              -- pyobjc 子模块可用性标志 (True/False)
     list_visible_windows()         -- 当前 Space 内可见普通窗口 (z 序, 前 -> 后)
     mark_fullscreen_windows(wins)  -- 就地为窗口列表标记 fullscreen: True/False
     focus_window(target)           -- 把目标窗口带到最前, 并用 z 序实时确认生效
+    scroll_window(target, delta, pixel_unit)
+                                   -- 对目标窗口模拟鼠标滚轮上下滚动 (page_turn 用)
+    scroll_support_info()          -- 滚动链路可用性探测 (只读, 诊断用)
+    cursor_location()              -- 当前鼠标光标位置 (只读, 诊断用)
+    entry_fields_info(target)      -- 只读: 窗口文本输入框清单 + 聚焦状态（诊断用）
+    focused_entry_state(target)    -- 只读快查: 是否正聚焦在文本输入框（toggle 判定）
+    focus_entry_field(target, index)
+                                   -- 聚焦第 index 个可见输入框（insert 模式“进入”）
+    blur_entry_field(target)       -- 取消聚焦（insert 模式“退出”），多级尝试 + 读回确认
+    insert_support_info()          -- 聚焦链路可用性探测（只读, 诊断用）
+    ax_error_name(err)             -- AXError 错误码 -> 中文名（诊断输出用）
     run_diagnostics(target_pid)    -- 诊断模式: 逐环自检切换链路 (排障用)
 
 依赖: pynput 在 macOS 上自动安装 pyobjc (Quartz/AppKit/ApplicationServices),
@@ -41,6 +51,27 @@ pyobjc / 子进程细节:
        osascript + System Events (Apple 事件): 置前应用并抬升匹配窗口, 也可查
        bundle id (需要“自动化”权限, 与辅助功能相互独立, 失败不影响主链路)。
        open -b <bundle-id> / -a <应用名>: 走 LaunchServices 激活, 不需要 TCC 授权。
+    6) Quartz CGEvent -- 滚轮事件 (区域 8, 供 actions/page_turn.py 页面滚动用)
+       CGEventCreateScrollWheelEvent 创建滚轮事件 (wheelAmount 正数=向上滚、
+       负数=向下滚, 已在本机用密闭 Tk 窗口实测确认); CGEventSetLocation 把
+       事件坐标设到目标窗口中心; CGEventPost 投入 HID 事件流后, 窗口服务器按
+       “事件坐标落在哪个窗口”命中路由 —— 滚动去向与物理光标停在哪里无关
+       (同一实验同时实测: CGEventPostToPid 直达指定应用不生效, 故不采用;
+       坐标不落在任何普通窗口上的事件会被丢弃)。需“辅助功能”授权,
+       与 pynput 键盘监听共用同一份。
+    7) ApplicationServices (HIServices) -- AX 焦点定位 (区域 9, 供
+       actions/insert_mode.py 的 vim 式 insert 模式用)
+       AXUIElementCopyAttributeValue(app, "AXFocusedUIElement") 读应用当前
+       聚焦的元素 (判定网页输入框是否聚焦, 并在聚焦/取消后读回复核);
+       AXUIElementSetAttributeValue(element, "AXFocused", ...) 写 True/False
+       等价“点进输入框/点回页面空白处”, 不移动鼠标、不会误点链接; 遍历
+       AXChildren/AXRole 在网页子树 (AXWebArea) 里找输入框。Chrome/Electron
+       默认不向辅助技术暴露网页子树, 写 AXManualAccessibility /
+       AXEnhancedUserInterface 轻推开启 (其他应用不认识, 写失败即忽略)。
+    8) Quartz CGEvent -- 键盘事件 (区域 10, 取消聚焦的 Esc 兜底)
+       CGEventCreateKeyboardEvent + CGEventPost 合成 Esc 按下/抬起投入 HID
+       事件流, 由系统路由给当前聚焦的应用; 仅作区域 9 的 AX 两级都失败后
+       的最后兜底 (部分浏览器只有搜索框响应 Esc, 且会先结束输入法组字)。
 
 失败兜底链 (focus_window): AX API -> osascript (System Events) -> open
 (LaunchServices) -> NSRunningApplication; 每级“声称成功”后都用 z 序实时确认
@@ -63,7 +94,9 @@ import time
 #   Quartz              -> CoreGraphics 窗口服务 (CGWindowList / CGDisplay)
 #   AppKit              -> Cocoa (NSRunningApplication 激活兜底)
 #   ApplicationServices -> HIServices 的 Accessibility API (窗口枚举/置前)
-#   CoreFoundation      -> kCFBooleanTrue (AXFrontmost 属性写入常量)
+#   CoreFoundation      -> kCFBooleanTrue / kCFBooleanFalse (AXFrontmost /
+#                          AXFocused 属性写入常量, 后者供区域 9 聚焦/取消聚焦
+#                          网页输入框使用)
 # 任一导入失败都只降级不崩溃: 对应 *_OK 置 False, 上层据此提示并跳过相应链路,
 # 诊断模式也依赖这两个标志报告真实可用性。
 # ===========================================================================
@@ -91,7 +124,7 @@ try:
         AXValueGetValue,
         AXIsProcessTrusted,
     )
-    from CoreFoundation import kCFBooleanTrue
+    from CoreFoundation import kCFBooleanTrue, kCFBooleanFalse
     AX_OK = True
 except Exception:                                          # pragma: no cover
     AX_OK = False
@@ -100,6 +133,10 @@ __all__ = [
     'QUARTZ_OK', 'AX_OK',
     'list_visible_windows', 'mark_fullscreen_windows',
     'focus_window', 'run_diagnostics',
+    'scroll_window', 'scroll_support_info', 'cursor_location',
+    'ax_error_name',
+    'entry_fields_info', 'focused_entry_state',
+    'focus_entry_field', 'blur_entry_field', 'insert_support_info',
 ]
 
 
@@ -578,7 +615,7 @@ def focus_window(target):
 
 
 # ===========================================================================
-# 区域 7: 诊断模式 -- 逐环自检切换链路 (排障用, 供 simple_actions 入口调用)
+# 区域 7: 诊断模式 -- 逐环自检切换链路 (排障用, 供 switch_windows 入口调用)
 # ---------------------------------------------------------------------------
 # 依次检查: 模块可用性 -> AXIsProcessTrusted 授权 -> CGWindowList 实时窗口 ->
 # AX 读 AXWindows / 写 AXFrontmost 的真实返回码 -> osascript + System Events
@@ -597,6 +634,13 @@ _AX_ERROR_NAMES = {
     -25208: 'kAXErrorNotImplemented 未实现',
     -25211: 'kAXErrorCannotComplete 无法完成',
 }
+
+
+def ax_error_name(err):
+    """把 AXError 错误码翻译成可读名称 (诊断输出用; 未知码原样带回)。"""
+    if err in _AX_ERROR_NAMES:
+        return _AX_ERROR_NAMES[err]
+    return '未知错误(%s)' % err
 
 
 def run_diagnostics(target_pid=None):
@@ -695,3 +739,749 @@ def run_diagnostics(target_pid=None):
     else:
         print('切换链路全部正常, 可以直接使用 shift+a/d; 若监听脚本还在运行旧代码, '
               '请重启 main.py 后再试。')
+
+
+# ===========================================================================
+# 区域 8: 滚轮事件 (scroll wheel) -- 模拟鼠标滚轮, 让“当前窗口”上下滚动
+# ---------------------------------------------------------------------------
+# 系统 API (Quartz CGEvent, 需“辅助功能”授权, 与 pynput 键盘监听共用同一份):
+#   CGEventCreateScrollWheelEvent(source, units, wheelCount, wheelAmount)
+#       创建一根滚轴的滚轮事件: source 传 None (无事件来源); units 取
+#       kCGScrollEventUnitPixel(0) 按像素滚动 (滚动距离跨应用一致) 或
+#       kCGScrollEventUnitLine(1) 按“行”滚动 (语义对齐传统滚轮); wheelAmount
+#       的符号即滚动方向 —— 正数 = 向上滚 (查看之前内容), 负数 = 向下滚 (查看
+#       后续内容), 与 NSEvent.deltaY 同号 (本机密闭 Tk 窗口实测确认)。
+#   CGEventSetLocation(event, point)
+#       把事件坐标设到目标窗口中心 (CG 全局坐标, 与 CGWindowBounds 同一坐标
+#       系)。实测确认: CGEventPost 投入事件流后, 窗口服务器按“事件坐标落在
+#       哪个窗口”命中路由 —— 与物理光标停在哪里无关、与 key window 无关;
+#       不设坐标的事件落在 (0,0), 会滚错目标。
+#   CGEventPost(kCGHIDEventTap, event)
+#       把事件投入 HID 事件流, 由窗口服务器按事件坐标命中路由到目标窗口。
+#       (同族 API CGEventPostToPid 直达指定应用在本机实测不生效, 不采用。)
+#   CGEventCreate(None) + CGEventGetLocation(event)
+#       查询鼠标光标当前位置 (只读, 诊断用)。
+# 平滑滚动: scroll_window 单次只投递一个事件; 上层 (actions/page_turn.py) 以
+#   ~100Hz 高频、指数缓出的小步长连续调用它, 把一次按键的滚动量摊成丝滑
+#   动画 —— 单发一笔大步长事件在多数应用里会“咯噔”一下跳变。
+# 边界: CGEventPost 返回 void, “投递成功”不代表应用一定消费了滚动 (个别应用
+#   不响应合成滚轮事件); 实际效果靠诊断模式的实测项肉眼确认。
+# ===========================================================================
+
+_QUARTZ_SCROLL_UNIT_PIXEL = 0          # kCGScrollEventUnitPixel: 按像素滚动
+_QUARTZ_SCROLL_UNIT_LINE = 1           # kCGScrollEventUnitLine: 按行滚动
+
+
+def _create_scroll_wheel_event(delta, pixel_unit):
+    """创建一根滚轴的滚轮事件; wheelAmount 为整数 (正=向上滚, 负=向下滚)。"""
+    unit = _QUARTZ_SCROLL_UNIT_PIXEL if pixel_unit else _QUARTZ_SCROLL_UNIT_LINE
+    amount = int(round(delta))
+    try:
+        return Quartz.CGEventCreateScrollWheelEvent(None, unit, 1, amount)
+    except TypeError:
+        # 个别 pyobjc 绑定要求把滚轴的量给全 (wheelCount=1 时后两轴传 0 即可)
+        return Quartz.CGEventCreateScrollWheelEvent(None, unit, 1, amount, 0, 0)
+
+
+def cursor_location():
+    """当前鼠标光标位置 (CG 全局坐标 (x, y)); 拿不到时返回 None。只读, 诊断用。"""
+    if not QUARTZ_OK:
+        return None
+    try:
+        point = Quartz.CGEventGetLocation(Quartz.CGEventCreate(None))
+        return (float(point.x), float(point.y))
+    except Exception:
+        return None
+
+
+def scroll_support_info():
+    """滚动链路可用性探测 (只读, 供 actions/page_turn.py 的自检与排障使用)。
+
+    返回字段 (纯 Python 值):
+        quartz_ok     Quartz 子模块是否可用
+        ax_trusted    辅助功能授权状态 (投递事件的前提, 与 pynput 共用授权)
+        create_event  能否创建滚轮事件 (CGEventCreateScrollWheelEvent)
+        post_hid      能否投递 HID 事件流 (CGEventPost)
+        cursor        当前光标位置 (x, y) 或 None (滚动路由与光标无关, 供参照)
+    """
+    info = {
+        'quartz_ok': QUARTZ_OK,
+        'ax_trusted': False,
+        'create_event': False,
+        'post_hid': False,
+        'cursor': None,
+    }
+    if not QUARTZ_OK:
+        return info
+    info['create_event'] = hasattr(Quartz, 'CGEventCreateScrollWheelEvent')
+    info['post_hid'] = hasattr(Quartz, 'CGEventPost')
+    if AX_OK:
+        try:
+            info['ax_trusted'] = bool(AXIsProcessTrusted())
+        except Exception:
+            info['ax_trusted'] = False
+    info['cursor'] = cursor_location()
+    return info
+
+
+def scroll_window(target, delta, pixel_unit=True):
+    """对目标窗口模拟一次鼠标滚轮滚动 (页面上下滚动的平台入口)。
+
+    target: list_visible_windows() 返回的窗口 dict (取其 bounds);
+    delta: 正数 = 向上滚 (查看之前内容), 负数 = 向下滚 (查看后续内容);
+    pixel_unit: True 按像素滚动 / False 按“行”滚动。
+    返回 (是否成功投递, 投递方式描述字符串); 投递成功不代表应用一定消费滚动。
+
+    机制: 事件坐标设到目标窗口中心后投入 HID 事件流, 窗口服务器按事件坐标
+    命中路由 —— 物理光标停在哪里都不影响滚动去向; 但要求目标窗口在该坐标处
+    就是上层普通窗口 (业务层传入 z 序最前的窗口即可满足)。
+    """
+    if not QUARTZ_OK:
+        return False, 'Quartz 不可用'
+    try:
+        event = _create_scroll_wheel_event(delta, pixel_unit)
+    except Exception as exc:
+        return False, '创建滚轮事件失败: %r' % (exc,)
+    if event is None:
+        return False, '创建滚轮事件失败: 返回空事件'
+    # 事件坐标 = 目标窗口中心: 命中路由按它找窗口; 设置失败宁可报错也不投递,
+    # 否则事件会用缺省坐标 (0,0), 滚到别的窗口上。
+    try:
+        Quartz.CGEventSetLocation(
+            event, (float(target['x']) + float(target['w']) / 2.0,
+                    float(target['y']) + float(target['h']) / 2.0))
+    except Exception as exc:
+        return False, '设置事件坐标失败: %r' % (exc,)
+    try:
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
+        return True, 'CGEventPost -> HID 事件流 (按事件坐标命中路由)'
+    except Exception as exc:
+        return False, '事件投递失败: %r' % (exc,)
+
+
+# ===========================================================================
+# 区域 9: AX 焦点定位与文本框枚举 -- vim 式 insert 模式的平台机制
+# (供 actions/insert_mode.py 使用: 聚焦/取消聚焦网页输入框)
+# ---------------------------------------------------------------------------
+# 系统 API (ApplicationServices / HIServices, 需“辅助功能”授权, 与 pynput
+# 键盘监听共用同一份):
+#   AXUIElementCopyAttributeValue(app, "AXFocusedUIElement")
+#       读应用“当前聚焦的 UI 元素”: 判定网页输入框是否聚焦 (输入/阅览模式),
+#       以及每次聚焦/取消后的实时复核 —— 与激活兜底链的 z 序确认同风格:
+#       每级“声称成功”都必须读回确认, 未确认就换下一级。
+#   AXUIElementSetAttributeValue(element, "AXFocused", kCFBooleanTrue/False)
+#       把 AX 树里的某个元素设为聚焦/取消聚焦。浏览器把网页输入框暴露成
+#       AXTextField/AXTextArea/AXSearchField/AXComboBox, 对它写 True 等价于
+#       “点进输入框”但不移动鼠标; 写 False 或把焦点挪到网页区 (AXWebArea)/
+#       窗口容器等价于“点回页面空白处”。相比合成鼠标点击, 不会误触链接。
+#   AXUIElementCopyAttributeValue(element, "AXRole"/"AXChildren"/...)
+#       深度优先遍历 AX 窗口子树找输入框; 树序约等于页面 DOM 顺序 (页面主
+#       输入框通常靠前)。节点数/深度设上限, 避免超大页面拖垮 AX 往返。
+#   AXUIElementSetAttributeValue(app, "AXManualAccessibility" /
+#       "AXEnhancedUserInterface", kCFBooleanTrue)
+#       Chrome/Electron 系应用检测不到辅助技术时默认不把网页内容暴露成
+#       AX 子树 (扫不到输入框), 写这两个属性是让它在无扩展前提下开启网页
+#       无障碍树的公认手段; 其他应用不认识这些属性, 写失败即静默忽略。
+# 边界: 只考虑“可见”输入框 (有尺寸且与目标窗口 bounds 相交); 不写输入框的
+#   AXValue 文本内容 (只在取标签时读一次并截断, 绝不修改); AX 元素不出本文件。
+# ===========================================================================
+
+_AX_FOCUSED_UI_ELEMENT_ATTR = 'AXFocusedUIElement'   # 应用当前聚焦的元素
+_AX_FOCUSED_ATTR = 'AXFocused'                       # 元素的聚焦开关 (可写)
+_AX_ROLE_ATTR = 'AXRole'
+_AX_CHILDREN_ATTR = 'AXChildren'
+_AX_TITLE_ATTR = 'AXTitle'
+_AX_DESCRIPTION_ATTR = 'AXDescription'
+_AX_PLACEHOLDER_ATTR = 'AXPlaceholderValue'
+_AX_VALUE_ATTR = 'AXValue'
+
+_AX_WEB_AREA_ROLE = 'AXWebArea'      # 浏览器网页内容的 AX 子树根
+# 可输入文本的 AX 角色 (网页输入框/多行编辑框/搜索框/可编辑下拉框)
+_AX_ENTRY_ROLES = ('AXTextField', 'AXTextArea', 'AXSearchField', 'AXComboBox')
+
+_AX_MANUAL_ACCESSIBILITY_ATTR = 'AXManualAccessibility'   # Chromium 轻推键 (新)
+_AX_ENHANCED_UI_ATTR = 'AXEnhancedUserInterface'          # Chromium 轻推键 (旧)
+
+_AX_SCAN_MAX_NODES = 2000         # 单次 AX 树扫描的节点上限 (防超大页面)
+_AX_SCAN_MAX_DEPTH = 20           # 单次 AX 树扫描的深度上限
+_AX_FIELD_MIN_WIDTH = 16.0        # 比这更窄/更矮的“输入框”视为不可见装饰
+_AX_FIELD_MIN_HEIGHT = 8.0
+_NUDGE_POLL_INTERVAL = 0.25       # 轻推 Chromium 后轮询网页区出现的步长
+_NUDGE_TOTAL_SECONDS = 2.0        # 轻推后等待网页无障碍树构建的总时限
+_FOCUS_VERIFY_TIMEOUT = 0.8       # 聚焦/取消后的读回复核时限
+_FOCUS_VERIFY_INTERVAL = 0.05
+
+
+def _ax_role(element):
+    """读 AX 元素的角色名 (如 AXTextField); 读不到返回 None。"""
+    err, value = _ax_copy_attribute(element, _AX_ROLE_ATTR)
+    return value if err == 0 and isinstance(value, str) else None
+
+
+def _ax_children(element):
+    """读 AX 元素的子元素列表; 读不到返回空列表。"""
+    err, value = _ax_copy_attribute(element, _AX_CHILDREN_ATTR)
+    if err != 0 or not value:
+        return []
+    return list(value)
+
+
+def _ax_geometry(element):
+    """读 AX 元素的位置/大小 (CG 全局坐标); 读不到返回 (None, None)。"""
+    _, pos_value = _ax_copy_attribute(element, _AX_POSITION_ATTR)
+    _, size_value = _ax_copy_attribute(element, _AX_SIZE_ATTR)
+    if pos_value is None or size_value is None:
+        return None, None
+    pos = _axvalue_to_pair(pos_value, is_point=True)
+    size = _axvalue_to_pair(size_value, is_point=False)
+    return pos, size
+
+
+def _ax_element_label(element):
+    """输入框的可读标签: AXTitle -> AXDescription -> AXPlaceholderValue ->
+    AXValue 前段 (只读展示用, 截断防长文本; 绝不写回)。"""
+    for attr in (_AX_TITLE_ATTR, _AX_DESCRIPTION_ATTR, _AX_PLACEHOLDER_ATTR):
+        err, value = _ax_copy_attribute(element, attr)
+        if err == 0 and isinstance(value, str) and value.strip():
+            return value.strip()[:24]
+    err, value = _ax_copy_attribute(element, _AX_VALUE_ATTR)
+    if err == 0 and isinstance(value, str) and value.strip():
+        return '内容:%s' % value.strip()[:18]
+    return ''
+
+
+def _ax_focused_ui_element(app_element):
+    """读应用当前聚焦的 UI 元素; 返回 (元素或 None, 错误码)。
+
+    本机实测 (Chrome): 网页输入框聚焦时这里返回的就是该字段 (role=
+    AXTextField); 浏览态返回网页区 (AXWebArea); 网页无障碍树未开启时可能
+    给出属性探测不了的占位引用 —— 角色读不到时不能当作“阅览”乱报。
+    """
+    return _ax_copy_attribute(app_element, _AX_FOCUSED_UI_ELEMENT_ATTR)
+
+
+def _ax_own_focused(element):
+    """读 AX 元素“自身是否聚焦” (AXFocused 属性, 只读); 返回 (错误码, bool|None)。
+
+    本机实测 (Chrome): 这是判定网页输入框聚焦与否的最可靠信号 —— 对字段写
+    AXFocused=True 后 0.3s 内自身读回 True; app 层的 AXFocusedUIElement 在
+    个别状态下会给出探测不了的引用, 不如自身读回稳。
+    """
+    err, value = _ax_copy_attribute(element, _AX_FOCUSED_ATTR)
+    if err != 0:
+        return err, None
+    return 0, bool(value)
+
+
+def _ax_element_matches_geometry(element, pos, size, tolerance=2.0):
+    """判断 AX 元素的位置/大小是否与给定值一致 (识别“聚焦的就是那个框”)。
+
+    个别应用把可编辑元素报成非标准角色时, 用几何位置兜底确认。
+    """
+    if element is None or pos is None or size is None:
+        return False
+    actual_pos, actual_size = _ax_geometry(element)
+    if actual_pos is None or actual_size is None:
+        return False
+    return (abs(actual_pos[0] - pos[0]) <= tolerance
+            and abs(actual_pos[1] - pos[1]) <= tolerance
+            and abs(actual_size[0] - size[0]) <= tolerance
+            and abs(actual_size[1] - size[1]) <= tolerance)
+
+
+def _nudge_browser_accessibility(app_element):
+    """轻推 Chrome/Electron 系应用开启网页无障碍树 (其他应用写入失败即忽略)。
+
+    Chromium 检测不到辅助技术时默认不把网页内容暴露成 AX 子树; 写
+    AXManualAccessibility (新) / AXEnhancedUserInterface (旧) 让它开启。
+    本机实测: 轻推后网页区约 2s 才长出来, 所以调用方要轮询重扫而不是只等
+    一次固定时长; 写入返回码不可信 (Chrome 对 AXEnhancedUserInterface 的
+    写返回 -25208 但实际生效), 以“网页区是否出现”为准。
+    """
+    for attr in (_AX_MANUAL_ACCESSIBILITY_ATTR, _AX_ENHANCED_UI_ATTR):
+        try:
+            AXUIElementSetAttributeValue(app_element, attr, kCFBooleanTrue)
+        except Exception:
+            continue
+
+
+def _ax_entry_scan(app_element, window_element, nudge=True):
+    """深度优先遍历 AX 窗口子树, 按树序收集文本输入框与网页区。
+
+    树序约等于页面 DOM 顺序 (页面主输入框通常靠前); 输入框本身不再往下
+    遍历。每个输入框带 in_web 标记 (是否位于 AXWebArea 网页子树内) ——
+    浏览器窗口里地址栏等原生输入框混在同一棵树上, 聚焦时必须优先网页内的,
+    否则会把光标聚焦到地址栏而不是页面输入框。
+    nudge=True 且首扫没有网页区 (也没有网页内输入框) 时, 先轻推 Chromium
+    开启网页无障碍树, 再按 _NUDGE_POLL_INTERVAL 步长轮询重扫, 总时限
+    _NUDGE_TOTAL_SECONDS (本机实测 Chrome/Electron 在轻推后约 2s 长出网页
+    区, 出现即提前结束); 这是“进入输入模式”的主链路, 纯只读诊断传 False,
+    避免诊断模式改变应用状态。
+    返回 dict: fields 为 {'element': AX元素, 'in_web': bool} 列表 (AX 元素
+    不出本文件对外), web_areas 为 AX 元素列表, 另有 scanned_nodes /
+    truncated / nudged 计数与标记。
+    """
+    result = {'fields': [], 'web_areas': [], 'scanned_nodes': 0,
+              'truncated': False, 'nudged': False}
+
+    def _scan_once():
+        fields, web_areas, visited = [], [], 0
+        stack = [(window_element, 0, False)]
+        while stack and visited < _AX_SCAN_MAX_NODES:
+            element, depth, in_web = stack.pop()
+            visited += 1
+            role = _ax_role(element)
+            if role == _AX_WEB_AREA_ROLE:
+                web_areas.append(element)
+                in_web = True               # 网页区子树内的元素都标记 in_web
+            if role in _AX_ENTRY_ROLES:
+                fields.append({'element': element, 'in_web': in_web})
+                continue                    # 输入框无需再往下遍历
+            if depth >= _AX_SCAN_MAX_DEPTH:
+                continue
+            for child in reversed(_ax_children(element)):
+                stack.append((child, depth + 1, in_web))
+        return fields, web_areas, visited, bool(stack)
+
+    fields, web_areas, visited, truncated = _scan_once()
+    if nudge and not web_areas and not any(item['in_web'] for item in fields):
+        _nudge_browser_accessibility(app_element)
+        result['nudged'] = True
+        deadline = time.monotonic() + _NUDGE_TOTAL_SECONDS
+        while True:
+            time.sleep(_NUDGE_POLL_INTERVAL)
+            fields, web_areas, visited, truncated = _scan_once()
+            if web_areas or time.monotonic() >= deadline:
+                break
+    result['fields'] = fields
+    result['web_areas'] = web_areas
+    result['scanned_nodes'] = visited
+    result['truncated'] = truncated
+    return result
+
+
+def _field_visible(pos, size, bounds):
+    """输入框可见判定: 有实际尺寸, 且与目标窗口 bounds 相交 (面积>0)。"""
+    if pos is None or size is None:
+        return False
+    if size[0] < _AX_FIELD_MIN_WIDTH or size[1] < _AX_FIELD_MIN_HEIGHT:
+        return False
+    bx, by, bw, bh = bounds
+    overlap_w = min(pos[0] + size[0], bx + bw) - max(pos[0], bx)
+    overlap_h = min(pos[1] + size[1], by + bh) - max(pos[1], by)
+    return overlap_w > 0 and overlap_h > 0
+
+
+def _ax_match_window_root(pid, bounds):
+    """拿目标应用的 AX 窗口, 按 CGWindowBounds 匹配出目标窗口的 AX 根元素。
+
+    返回 (根元素或 None, 是否按 bounds 精确匹配); 匹配失败时退回该应用的
+    第一个 AX 窗口 (调用方会把兜底情况告诉上层)。
+    """
+    infos = _ax_window_infos(pid)
+    if not infos:
+        return None, False
+    matched = _match_window_by_bounds(bounds, infos)
+    if matched is not None:
+        return matched['element'], True
+    return infos[0]['element'], False
+
+
+def _wait_until_focus(app_element, success_check,
+                      timeout=_FOCUS_VERIFY_TIMEOUT,
+                      interval=_FOCUS_VERIFY_INTERVAL):
+    """轮询读回 AXFocusedUIElement, 直到 success_check(元素, 错误码) 成立。
+
+    与 _wait_until_window_top 同风格: AX 写属性是异步生效的, 必须“读回确认”,
+    不能只信 AXUIElementSetAttributeValue 的返回码。
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        focused, err = _ax_focused_ui_element(app_element)
+        try:
+            if success_check(focused, err):
+                return True
+        except Exception:
+            pass
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(interval)
+
+
+def insert_support_info():
+    """聚焦链路可用性探测 (只读, 供 actions/insert_mode.py 的自检使用)。
+
+    返回字段 (纯 Python 值):
+        ax_ok           AX API 是否可用
+        ax_trusted      辅助功能授权状态 (与 pynput 键盘监听共用同一份授权)
+        keyboard_event  能否合成键盘事件 (Esc 兜底用, 缺了只少一级兜底)
+    """
+    info = {'ax_ok': AX_OK, 'ax_trusted': False, 'keyboard_event': False}
+    if AX_OK:
+        try:
+            info['ax_trusted'] = bool(AXIsProcessTrusted())
+        except Exception:
+            info['ax_trusted'] = False
+    if QUARTZ_OK:
+        try:
+            info['keyboard_event'] = (hasattr(Quartz, 'CGEventCreateKeyboardEvent')
+                                      and hasattr(Quartz, 'CGEventPost'))
+        except Exception:
+            info['keyboard_event'] = False
+    return info
+
+
+def entry_fields_info(target, nudge=False):
+    """只读探查目标窗口的文本输入框清单与当前聚焦状态 (诊断/预览用)。
+
+    target: list_visible_windows() 返回的窗口 dict。nudge 默认 False (纯只读,
+    不轻推 Chromium, 诊断模式不改变应用状态; “进入输入模式”的实测主链路才
+    轻推)。AX 元素不出本文件, 返回的 fields 只有纯 Python 数据。
+    """
+    info = {
+        'window_matched': False, 'web_areas': 0, 'scanned_nodes': 0,
+        'truncated': False, 'nudged': False, 'fields': [],
+        'focused': None, 'focused_is_entry': False, 'detail': '',
+    }
+    if not AX_OK:
+        info['detail'] = 'AX API 不可用 (缺少 pyobjc ApplicationServices)'
+        return info
+    try:
+        pid = int(target['pid'])
+        bounds = (float(target['x']), float(target['y']),
+                  float(target['w']), float(target['h']))
+        app = AXUIElementCreateApplication(pid)
+        root, matched = _ax_match_window_root(pid, bounds)
+        info['window_matched'] = matched
+        if root is None:
+            info['detail'] = ('读不到该应用的 AX 窗口列表 (辅助功能未授权, '
+                              '或应用不向辅助功能暴露窗口)')
+            return info
+        scan = _ax_entry_scan(app, root, nudge=nudge)
+        info['web_areas'] = len(scan['web_areas'])
+        info['scanned_nodes'] = scan['scanned_nodes']
+        info['truncated'] = scan['truncated']
+        info['nudged'] = scan['nudged']
+        for item in scan['fields']:
+            element = item['element']
+            pos, size = _ax_geometry(element)
+            info['fields'].append({
+                'role': _ax_role(element) or '?',
+                'label': _ax_element_label(element),
+                'x': pos[0] if pos else 0.0, 'y': pos[1] if pos else 0.0,
+                'w': size[0] if size else 0.0, 'h': size[1] if size else 0.0,
+                'visible': _field_visible(pos, size, bounds),
+                'in_web': item['in_web'],
+            })
+        focused, err = _ax_focused_ui_element(app)
+        if focused is not None:
+            pos, size = _ax_geometry(focused)
+            role = _ax_role(focused)
+            if role is not None and role not in _AX_ENTRY_ROLES:
+                # 聚焦在容器 (网页区/窗口等) 时下钻一层找真实聚焦的输入框
+                err2, inner = _ax_copy_attribute(
+                    focused, _AX_FOCUSED_UI_ELEMENT_ATTR)
+                if err2 == 0 and inner is not None:
+                    inner_role = _ax_role(inner)
+                    if inner_role in _AX_ENTRY_ROLES:
+                        focused, role = inner, inner_role
+                        pos, size = _ax_geometry(focused)
+            if role is not None:
+                info['focused'] = {
+                    'role': role,
+                    'label': _ax_element_label(focused),
+                    'x': pos[0] if pos else 0.0, 'y': pos[1] if pos else 0.0,
+                    'w': size[0] if size else 0.0, 'h': size[1] if size else 0.0,
+                }
+                info['focused_is_entry'] = role in _AX_ENTRY_ROLES
+            else:
+                # 聚焦元素属性读不到: 不能当作“阅览”乱报, 如实标为未知
+                info['focused_is_entry'] = None
+                info['detail'] = ('聚焦元素属性读不到 (典型: 浏览器网页无障碍树'
+                                  '未开启), 聚焦状态无法判定')
+        elif err != 0:
+            info['detail'] = ('读不到聚焦元素: err=%s (%s)'
+                              % (err, ax_error_name(err)))
+    except Exception as exc:
+        info['detail'] = 'AX 扫描异常: %r' % (exc,)
+    return info
+
+
+def _ax_pick_focused_entry(scan):
+    """在扫描结果里找“自身 AXFocused 读回 True”的输入框; 返回 item 或 None。
+
+    app 层 AXFocusedUIElement 在 Chrome 上部分状态会给出属性探测不了的
+    占位引用, 逐字段自身读回是实测最可靠的聚焦判定。
+    """
+    for item in scan['fields']:
+        e, v = _ax_own_focused(item['element'])
+        if e == 0 and v:
+            return item
+    return None
+
+
+def focused_entry_state(target):
+    """快查当前窗口的聚焦状态 (只读, toggle 的判定依据)。
+
+    判定顺序: 1) app 层 AXFocusedUIElement 角色可读且是输入框 -> True;
+    2) 扫描子树逐字段自身 AXFocused 读回 (Chrome 网页字段的可靠信号) ->
+    True; 3) 有输入框/网页区但无人自称聚焦 -> False (阅览); 4) 扫不到任何
+    输入框且聚焦元素属性也读不到 -> None (无法判定, 上层按“进入”处理)。
+    返回 (状态, 描述)。
+    """
+    if not AX_OK:
+        return None, 'AX API 不可用 (缺少 pyobjc ApplicationServices)'
+    try:
+        pid = int(target['pid'])
+        bounds = (float(target['x']), float(target['y']),
+                  float(target['w']), float(target['h']))
+        app = AXUIElementCreateApplication(pid)
+        # 快路径: app 层聚焦元素角色可读且是输入框
+        focused, err = _ax_focused_ui_element(app)
+        if focused is not None:
+            role = _ax_role(focused)
+            if role in _AX_ENTRY_ROLES:
+                return True, '聚焦在 %s [%s]' % (
+                    role, _ax_element_label(focused) or '无标签')
+        # 慢路径: 逐字段自身 AXFocused 读回
+        root, _matched = _ax_match_window_root(pid, bounds)
+        if root is None:
+            return None, ('读不到该应用的 AX 窗口列表 (辅助功能未授权, 或应用'
+                          '不向辅助功能暴露窗口)')
+        scan = _ax_entry_scan(app, root, nudge=False)
+        item = _ax_pick_focused_entry(scan)
+        if item is not None:
+            role = _ax_role(item['element']) or '?'
+            return True, '聚焦在 %s [%s] (字段自身 AXFocused 读回确认)' % (
+                role, _ax_element_label(item['element']) or '无标签')
+        if scan['fields'] or scan['web_areas']:
+            return False, ('扫到 %d 个输入框 (网页区 %d 个), 均未聚焦 (阅览模式)'
+                           % (len(scan['fields']), len(scan['web_areas'])))
+        if focused is not None and _ax_role(focused) is not None:
+            return False, ('聚焦在 %s (非文本输入框, 阅览模式)'
+                           % _ax_role(focused))
+        return None, ('扫不到输入框且聚焦元素属性读不到 (浏览器网页无障碍树'
+                      '未开启?), 状态无法判定')
+    except Exception as exc:
+        return None, '读取聚焦状态异常: %r' % (exc,)
+
+
+def focus_entry_field(target, index=0):
+    """聚焦目标窗口 AX 树序第 index 个可见文本输入框 (insert 模式“进入”)。
+
+    机制: 遍历 AX 树找输入框 (Chrome 系会先轻推开启网页无障碍树) -> 对选中
+    元素写 AXFocused=True -> 轮询读回 AXFocusedUIElement 确认真的聚焦了
+    (与 focus_window 的 z 序确认同风格)。全程不合成鼠标/键盘事件, 不会误点
+    链接、不会输入任何字符。返回 (是否成功, 描述字符串)。
+    """
+    if not AX_OK:
+        return False, 'AX API 不可用 (缺少 pyobjc ApplicationServices)'
+    try:
+        pid = int(target['pid'])
+        bounds = (float(target['x']), float(target['y']),
+                  float(target['w']), float(target['h']))
+        app = AXUIElementCreateApplication(pid)
+        root, matched = _ax_match_window_root(pid, bounds)
+        if root is None:
+            return False, ('读不到该应用的 AX 窗口列表 (辅助功能未授权, 或应用'
+                           '不向辅助功能暴露窗口)')
+        scan = _ax_entry_scan(app, root, nudge=True)
+        visible = []
+        for item in scan['fields']:
+            pos, size = _ax_geometry(item['element'])
+            if _field_visible(pos, size, bounds):
+                visible.append({
+                    'element': item['element'], 'in_web': item['in_web'],
+                    'pos': pos, 'size': size,
+                    'role': _ax_role(item['element']) or '?',
+                    'label': _ax_element_label(item['element']),
+                })
+        if not visible:
+            where = ('该窗口' if matched
+                     else '窗口 bounds 匹配失败, 用第一个 AX 窗口兜底后')
+            hint = ('页面可能确实没有输入框' if scan['web_areas']
+                    else '若这是浏览器页面, 网页无障碍树可能未开启或页面无输入框')
+            return False, ('%s没有可见的文本输入框 (遍历 %d 个 AX 节点, 网页区 '
+                           '%d 个) —— %s' % (where, scan['scanned_nodes'],
+                                            len(scan['web_areas']), hint))
+        # 浏览器窗口里地址栏等原生输入框会混在树里: 有网页输入框时优先网页的,
+        # 避免把光标聚焦到地址栏而不是页面输入框。
+        page_entries = [item for item in visible if item['in_web']]
+        entries = page_entries if page_entries else visible
+        native_count = len(visible) - len(page_entries)
+        if index < 0 or index >= len(entries):
+            return False, ('可见%s共 %d 个 (网页 %d 个 + 原生 %d 个), 要聚焦的'
+                           '序号 %d 超出范围' % ('网页输入框' if page_entries
+                                               else '输入框', len(entries),
+                                               len(page_entries), native_count,
+                                               index))
+        chosen = entries[index]
+        scope = '网页输入框' if chosen['in_web'] else '原生输入框'
+        tag = chosen['label'] or chosen['role']
+        err = AXUIElementSetAttributeValue(chosen['element'], _AX_FOCUSED_ATTR,
+                                           kCFBooleanTrue)
+        if err != 0:
+            return False, ('写 AXFocused 失败: err=%s (%s)'
+                           % (err, ax_error_name(err)))
+
+        def _focused_on_chosen(_focused_now, _err_now):
+            # 信号1 (本机实测最可靠): 字段自身 AXFocused 读回 True
+            e, v = _ax_own_focused(chosen['element'])
+            if e == 0:
+                return bool(v)
+            # 信号2: app 层聚焦元素可读, 角色是输入框或几何与选中字段吻合
+            if _focused_now is not None:
+                if _ax_role(_focused_now) in _AX_ENTRY_ROLES:
+                    return True
+                return _ax_element_matches_geometry(_focused_now,
+                                                    chosen['pos'],
+                                                    chosen['size'])
+            return False
+
+        if _wait_until_focus(app, _focused_on_chosen):
+            return True, ('已聚焦%s第 %d 个 [%s] (AX 读回确认; 网页 %d 个 + '
+                          '原生 %d 个可见输入框)' % (scope, index + 1, tag,
+                                                   len(page_entries),
+                                                   native_count))
+        return False, ('写 AXFocused 声称成功 (err=0) 但读回的聚焦状态未变 —— '
+                       '该应用可能不接受 AX 聚焦, 请跑诊断看 [5] 一环')
+    except Exception as exc:
+        return False, '聚焦输入框异常: %r' % (exc,)
+
+
+def blur_entry_field(target):
+    """取消聚焦目标窗口里正聚焦的文本输入框 (insert 模式“退出”)。
+
+    取消目标按可靠性确定: app 层聚焦元素角色可读且是输入框 -> 直接用;
+    否则扫描子树找“自身 AXFocused 读回 True”的字段 (Chrome 网页字段的
+    可靠信号)。取消逐级尝试并读回确认, 未确认就换下一级 (与激活兜底链
+    同风格):
+      1) 对该字段写 AXFocused=False —— 部分原生应用支持;
+      2) 把 AX 焦点挪到容器 —— 本机实测 (Chrome): 对网页区 (AXWebArea) 写
+         AXFocused=True 等价“点回页面空白处”, 字段自身 AXFocused 随即翻
+         False; 网页区不存在时退而写 AX 窗口;
+      3) 合成 Esc 键兜底 (区域 10) —— 部分浏览器搜索框才响应, 且会先结束
+         输入法组字, 所以只在前两级都失败时才用。
+    本就没有聚焦的输入框时直接返回成功 (幂等)。返回 (是否成功, 描述字符串)。
+    """
+    if not AX_OK:
+        return False, 'AX API 不可用 (缺少 pyobjc ApplicationServices)'
+    try:
+        pid = int(target['pid'])
+        bounds = (float(target['x']), float(target['y']),
+                  float(target['w']), float(target['h']))
+        app = AXUIElementCreateApplication(pid)
+        root, _matched = _ax_match_window_root(pid, bounds)
+        if root is None:
+            return False, ('读不到该应用的 AX 窗口列表 (辅助功能未授权, 或应用'
+                           '不向辅助功能暴露窗口)')
+        scan = _ax_entry_scan(app, root, nudge=False)
+
+        # 确定要取消的聚焦目标 (app 层可读 -> 直接用; 否则逐字段自身读回)
+        chosen = None
+        focused, err = _ax_focused_ui_element(app)
+        if focused is not None:
+            role = _ax_role(focused)
+            if role in _AX_ENTRY_ROLES:
+                chosen = {'element': focused, 'role': role,
+                          'label': _ax_element_label(focused)}
+        if chosen is None:
+            item = _ax_pick_focused_entry(scan)
+            if item is not None:
+                chosen = {'element': item['element'],
+                          'role': _ax_role(item['element']) or '?',
+                          'label': _ax_element_label(item['element'])}
+        if chosen is None:
+            # 没有任何字段自称聚焦: 区分“真阅览”与“读不到”
+            if scan['fields'] or scan['web_areas']:
+                return True, ('扫到 %d 个输入框 (网页区 %d 个), 均未聚焦 —— '
+                              '本就处于阅览模式' % (len(scan['fields']),
+                                                  len(scan['web_areas'])))
+            if focused is not None and _ax_role(focused) is not None:
+                return True, ('当前聚焦的是 %s, 不是文本输入框 —— 本就处于阅览'
+                              '模式' % _ax_role(focused))
+            return False, ('扫不到输入框且聚焦元素属性读不到 (浏览器网页无障碍'
+                           '树未开启?), 无法确认也无法可靠取消')
+
+        label = chosen['label'] or chosen['role']
+
+        def _left_entry(_focused_now, _err_now):
+            # 信号1 (本机实测最可靠): 原聚焦字段自身 AXFocused 读回 False
+            e, v = _ax_own_focused(chosen['element'])
+            if e == 0:
+                return not bool(v)
+            # 信号2: app 层聚焦元素角色可读且不再是输入框 (读不到不算成功)
+            if _focused_now is not None:
+                now_role = _ax_role(_focused_now)
+                if now_role is not None:
+                    return now_role not in _AX_ENTRY_ROLES
+            return False
+
+        # 1) 对聚焦字段写 AXFocused=False
+        err = AXUIElementSetAttributeValue(chosen['element'], _AX_FOCUSED_ATTR,
+                                           kCFBooleanFalse)
+        if err == 0 and _wait_until_focus(app, _left_entry):
+            return True, ('已取消聚焦 [%s] (方式: AXFocused=False, AX 读回确认)'
+                          % label)
+
+        # 2) 焦点挪到容器: 优先网页区 (本机实测 Chrome 此路必通), 其次 AX 窗口
+        containers = []
+        for web_area in scan['web_areas'][:1]:
+            containers.append((web_area, '网页区 (AXWebArea)'))
+        containers.append((root, 'AX 窗口'))
+        for container, name in containers:
+            try:
+                err = AXUIElementSetAttributeValue(container, _AX_FOCUSED_ATTR,
+                                                   kCFBooleanTrue)
+            except Exception:
+                continue
+            if err == 0 and _wait_until_focus(app, _left_entry):
+                return True, ('已取消聚焦 [%s] (方式: 焦点挪到%s, AX 读回确认)'
+                              % (label, name))
+
+        # 3) Esc 键兜底
+        esc_ok, esc_path = _press_escape_key()
+        if esc_ok and _wait_until_focus(app, _left_entry):
+            return True, ('已取消聚焦 [%s] (方式: Esc 键兜底, AX 读回确认)'
+                          % label)
+        return False, ('取消聚焦失败: [%s] 读回仍在聚焦 (AX 两级%s; 请跑诊断看 '
+                       '[5] 一环)' % (label,
+                                      '与 Esc 兜底都无效' if esc_ok
+                                      else '无效, Esc 兜底不可用'))
+    except Exception as exc:
+        return False, '取消聚焦异常: %r' % (exc,)
+
+
+# ===========================================================================
+# 区域 10: 键盘事件兜底 -- 合成 Esc 键 (insert 模式“取消聚焦”的最后一级)
+# ---------------------------------------------------------------------------
+# 系统 API (Quartz CGEvent, 需“辅助功能”授权, 与 pynput 键盘监听共用同一份):
+#   CGEventCreateKeyboardEvent(source, virtualKey, keyDown)
+#       创建键盘事件: source 传 None (无事件来源); virtualKey 用虚拟键码
+#       (HIToolbox kVK_Escape = 53); keyDown True=按下 / False=抬起。
+#   CGEventPost(kCGHIDEventTap, event)
+#       投入 HID 事件流, 系统把它路由给“当前聚焦的应用” —— 正是要取消聚焦
+#       的那个窗口 (调用前提就是它在 z 序最前)。
+# 边界: Esc 在浏览器里通常只对搜索类输入框生效 (清除并退出), 对普通输入框
+#   可能无效; 且会先结束输入法的组字状态 —— 因此只作为区域 9 的 AX 两级
+#   都失败后的最后兜底, 每次使用后都由调用方读回聚焦状态确认真实效果。
+# ===========================================================================
+
+_KVK_ESCAPE = 53                        # HIToolbox 虚拟键码 kVK_Escape
+
+
+def _press_escape_key():
+    """合成一次 Esc 按下+抬起并投入 HID 事件流; 返回 (是否成功, 描述)。"""
+    if not QUARTZ_OK:
+        return False, 'Quartz 不可用'
+    try:
+        down = Quartz.CGEventCreateKeyboardEvent(None, _KVK_ESCAPE, True)
+        up = Quartz.CGEventCreateKeyboardEvent(None, _KVK_ESCAPE, False)
+        if down is None or up is None:
+            return False, '创建 Esc 键盘事件失败: 返回空事件'
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, down)
+        time.sleep(0.01)
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, up)
+        return True, 'CGEventPost -> HID 事件流 (Esc 按下+抬起)'
+    except Exception as exc:
+        return False, '合成 Esc 键失败: %r' % (exc,)

@@ -12,13 +12,17 @@ HOTKEYS = load_config()["hotkeys"]
 
 
 with keyboard.GlobalHotKeys({
-        '<shift>+w': on_activate_w,
+        '<shift>+<ctrl>+w': on_activate_w,
 
-        '<shift>+a': on_activate_a,
+        '<shift>+<ctrl>+a': on_activate_a,
 
-        '<shift>+s': on_activate_s,
+        '<shift>+<ctrl>+s': on_activate_s,
 
-        '<shift>+d': on_activate_d,
+        '<shift>+<ctrl>+d': on_activate_d,
+
+        '<shift>+<ctrl>+i': on_activate_i,
+
+        '<shift>+<esc>': on_activate_esc,
 
         }) as h:
     h.join()

@@ -2,3 +2,4 @@
 .DS_Dtore
 tests/
 __pycache__
+AGENTS.md
