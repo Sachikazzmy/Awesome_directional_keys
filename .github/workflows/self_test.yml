@@ -27,6 +27,6 @@ jobs:
                 echo "依赖下载完毕"
 
             - name: 测试切换页面
-              run: python3 src/actions/switch_windows.py
+              run: .venv/bin/python src/actions/switch_windows.py
 
 
