@@ -18,10 +18,12 @@ jobs:
             - name: 拉取代码
               uses: actions/checkout@v4
 
+            - name: 启用虚拟环境
+              run: python3 -m venv .venv
 
             - name: 安装python依赖
               run: |
-                python3 -m  pip install -r requirements.txt
+                .venv/bin/python -m pip install -r requirements.txt
                 echo "依赖下载完毕"
 
             - name: 测试切换页面
